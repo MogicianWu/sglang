@@ -5,9 +5,11 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
@@ -157,6 +159,38 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
+class _ParkedDirectWrite(msgspec.Struct, frozen=True):
+    """A write-back op parked behind the async D2H of its *index* tensors.
+
+    Only the small index tensors are staged here -- the payload (KV pages
+    and any piggybacked component state, e.g. mamba) has NOT been enqueued
+    yet; it moves when the op is dispatched. Created by _park_direct_write;
+    dispatched oldest-first by dispatch_ready_writes once copy_done fires.
+
+    Fields:
+      copy_done: device event recorded after all staging copies; once it
+        fires, the pinned buffers below hold valid, host-readable values.
+      op: the original CacheOperation. Its node is already counted in
+        ongoing_write_through with its component locks held (write_backup
+        establishes both before the hand-off), but no ack exists until the
+        op is dispatched.
+      device_indices: pinned host copy of op.device_indices -- the device
+        KV pool token-slot indices naming which physical slots hold this
+        node's tokens (int64, one per token).
+      transfer_indices: pinned host copies of each
+        op.pool_transfers[i].device_indices -- the per-component pool slot
+        ids piggybacked on this backup (for hybrids, the mamba state slot
+        ids; SWA where present). None when the op carries no extra pools.
+        op.host_indices needs no staging: the host allocator mints it as a
+        plain CPU tensor already.
+    """
+
+    copy_done: Any  # device-module Event recorded after the staging copies
+    op: CacheOperation
+    device_indices: torch.Tensor
+    transfer_indices: Optional[List[torch.Tensor]]
+
+
 class HybridCacheController(BaseHiCacheController):
     def __init__(
         self,
@@ -196,6 +230,23 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        # FIFO of write-back ops parked behind the in-flight async D2H of
+        # their *index* tensors (never the payload): each entry holds the
+        # original CacheOperation plus pinned host copies of its device-side
+        # index tensors, and a copy_done event marking when those values
+        # become host-readable (see _ParkedDirectWrite for the exact
+        # contents). While parked, the payload copies have not been
+        # enqueued and no ack exists, but the node is already counted in
+        # ongoing_write_through with its locks held. FIFO is load-bearing:
+        # writing_check processes acks as a queue prefix, so a younger op
+        # must not reach the write stream before an older one. Keeps the
+        # scheduler thread from blocking on device_indices.cpu() at
+        # hand-off time (see start_writing). Liveness contract: parked ops
+        # dispatch only via dispatch_ready_writes -- ordering-wise from the
+        # park branch in start_writing, liveness-wise from the per-tick
+        # writing_check hook; removing the writing_check call site would
+        # leave the last parked ops (and their node pins) lingering.
+        self._pending_direct_writes: deque[_ParkedDirectWrite] = deque()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
@@ -423,11 +474,104 @@ class HybridCacheController(BaseHiCacheController):
             host_indices = op.host_indices
             device_indices = op.device_indices
             resolved_pool_transfers = op.pool_transfers
+        elif (
+            self.io_backend == "direct"
+            and self.mem_pool_host.layout == "page_first_direct"
+        ):
+            # move_indices here would be a blocking device_indices.cpu() on
+            # the scheduler thread, inheriting the copy-stream backlog. Stage
+            # the D2H asynchronously and park the op instead; the drain
+            # completes it once the copy event fires (index resolution for
+            # this layout is the identity transform, so nothing else moves).
+            # Dispatch already-ready parked ops first: older ops must reach
+            # the write stream before this newer one (ack ordering).
+            self.dispatch_ready_writes()
+            self.write_queue.clear()
+            self._park_direct_write(op)
+            return
         else:
             host_indices, device_indices, resolved_pool_transfers = (
                 self.move_hybrid_indices(op)
             )
         self.write_queue.clear()
+        self._start_writing_op(
+            op,
+            host_indices=host_indices,
+            device_indices=device_indices,
+            resolved_pool_transfers=resolved_pool_transfers,
+        )
+
+    def _park_direct_write(self, op: CacheOperation) -> None:
+        """Enqueue async pinned D2H of every device-index tensor of *op* and
+        park it; the scheduler thread never blocks on the copies."""
+
+        def stage(dev: torch.Tensor) -> torch.Tensor:
+            # Pinned destination via torch's caching host allocator (blocks
+            # are recycled event-safely; steady state avoids cudaHostAlloc);
+            # a pinned dst makes the D2H a pure async enqueue.
+            pinned = torch.empty(dev.shape, dtype=dev.dtype, pin_memory=True)
+            pinned.copy_(dev, non_blocking=True)
+            return pinned
+
+        staged_device_indices = stage(op.device_indices)
+        staged_transfer_indices = (
+            [stage(t.device_indices) for t in op.pool_transfers]
+            if op.pool_transfers
+            else None
+        )
+        copy_done = device_module.Event()
+        copy_done.record()
+        self._pending_direct_writes.append(
+            _ParkedDirectWrite(
+                copy_done=copy_done,
+                op=op,
+                device_indices=staged_device_indices,
+                transfer_indices=staged_transfer_indices,
+            )
+        )
+
+    def dispatch_ready_writes(self) -> None:
+        """Opportunistically dispatch parked write ops whose index D2H has
+        finished (oldest-first; a not-yet-ready head holds back younger ops
+        to preserve ack ordering). Never blocks: a pending head just stays
+        parked until a later call finds its event fired."""
+
+        while self._pending_direct_writes:
+            head = self._pending_direct_writes[0]
+            if not head.copy_done.query():
+                break
+            self._pending_direct_writes.popleft()
+            op = head.op
+            resolved_pool_transfers = None
+            if op.pool_transfers:
+                resolved_pool_transfers = [
+                    PoolTransfer(
+                        name=t.name,
+                        host_indices=t.host_indices,
+                        device_indices=staged,
+                        keys=t.keys,
+                        hit_policy=t.hit_policy,
+                        indices_from_pool=t.indices_from_pool,
+                    )
+                    for t, staged in zip(
+                        op.pool_transfers, head.transfer_indices, strict=True
+                    )
+                ]
+            self._start_writing_op(
+                op,
+                host_indices=op.host_indices,
+                device_indices=head.device_indices,
+                resolved_pool_transfers=resolved_pool_transfers,
+            )
+
+    def _start_writing_op(
+        self,
+        op: CacheOperation,
+        *,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        resolved_pool_transfers: Optional[list],
+    ) -> None:
         start_event = device_module.Event()
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
         start_event.record()
