@@ -442,6 +442,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    # Host copy of the mask (scheduler-authored); lets consumers test it
+    # without a device sync. Unpadded — padding only appends False rows.
+    mamba_track_mask_cpu: Optional[List[bool]] = None
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
@@ -806,6 +809,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
+            mamba_track_mask_cpu=batch.mamba_track_mask_cpu,
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,

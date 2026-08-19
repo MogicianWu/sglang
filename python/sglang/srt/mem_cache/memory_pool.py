@@ -925,13 +925,15 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        # Slot bookkeeping lives on CPU; kernels need device indices.
+        indices_device = indices.pin_memory().to(self.device, non_blocking=True)
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
-            fused_clear_conv_slots(self._conv_slot_desc, indices)
+            fused_clear_conv_slots(self._conv_slot_desc, indices_device)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                temporal[:, indices_device] = 0
             return
         if not _is_npu:
             need_size = len(indices)
@@ -940,18 +942,18 @@ class MambaPool:
                 z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
                     t.shape[0], need_size, *t.shape[2:]
                 )
-                t[:, indices] = z
+                t[:, indices_device] = z
             t = self.mamba_cache.temporal
             z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
                 t.shape[0], need_size, *t.shape[2:]
             )
-            t[:, indices] = z
+            t[:, indices_device] = z
         else:
             for i in range(len(self.mamba_cache.conv)):
                 t = self.mamba_cache.conv[i]
-                t[:, indices] = 0
+                t[:, indices_device] = 0
             t = self.mamba_cache.temporal
-            t[:, indices] = 0
+            t[:, indices_device] = 0
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
@@ -964,6 +966,9 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        # Slot bookkeeping lives on CPU; kernels need device indices.
+        src_indices_device = src_indices.pin_memory().to(self.device, non_blocking=True)
+        dst_indices_device = dst_indices.pin_memory().to(self.device, non_blocking=True)
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -976,23 +981,26 @@ class MambaPool:
             from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
 
             if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+                # The host originals are in scope: no device readback needed.
                 overlap = set(src_indices.tolist()) & set(dst_indices.tolist())
                 assert not overlap, (
                     "fused copy_from requires disjoint src/dst slots; "
                     f"overlap={sorted(overlap)}"
                 )
-            fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
+            fused_copy_conv_slots(
+                self._conv_slot_desc, src_indices_device, dst_indices_device
+            )
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
+                temporal[:, dst_indices_device] = temporal[:, src_indices_device]
         else:
             for i in range(len(self.mamba_cache.conv)):
-                self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
-                    :, src_indices
-                ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
+                self.mamba_cache.conv[i][:, dst_indices_device] = self.mamba_cache.conv[
+                    i
+                ][:, src_indices_device]
+            self.mamba_cache.temporal[:, dst_indices_device] = (
+                self.mamba_cache.temporal[:, src_indices_device]
+            )
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
         # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring
@@ -1234,9 +1242,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
+        # Slot ids are request-level bookkeeping authored and consumed by the
+        # scheduler; a CPU free list makes every id read sync-free (kernels
+        # only see ids via the device-side mappings, updated with async
+        # pinned H2D below). Matches ReqToTokenPool's host free-slot list.
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
-            device=device,
+            device="cpu",
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
@@ -1349,13 +1361,32 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert len(select_index) == len(
                 mamba_ping_pong_track_buffers
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        # Upload from pinned memory: a copy from a pageable source (incl.
+        # torch's hidden upload when indexing with a Python list) routes
+        # through the driver's shared bounce buffers; pinned sources are
+        # DMA'd directly, keeping the upload cost independent of concurrent
+        # transfer traffic.
+        select_index_device = (
+            torch.tensor(select_index, dtype=torch.int64)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+        mamba_index_tensor = (
+            torch.stack(mamba_indices)
+            .to(dtype=torch.int32)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+        self.req_index_to_mamba_index_mapping[select_index_device] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
-                ping_pong_tensor
+            ping_pong_tensor = (
+                torch.stack(mamba_ping_pong_track_buffers)
+                .pin_memory()
+                .to(self.device, non_blocking=True)
             )
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                select_index_device
+            ] = ping_pong_tensor
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
@@ -1447,8 +1478,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
         req.mamba_ping_pong_track_buffer[idx] = value
-        self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx] = (
-            req.mamba_ping_pong_track_buffer
+        self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+            req.req_pool_idx
+        ] = req.mamba_ping_pong_track_buffer.pin_memory().to(
+            self.device, non_blocking=True
         )
 
     def donate_mamba_ping_pong_slot(
@@ -1483,9 +1516,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req.mamba_pool_idx = None
 
         if self.enable_mamba_extra_buffer:
-            mamba_ping_pong_track_buffer_to_free = (
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]
+            # Free from the req's host-side buffer (authoritative, sync-free)
+            # rather than a slice of the device mapping. Detached streaming-
+            # session slots (buffer is None here) free via the session path.
+            assert req.mamba_ping_pong_track_buffer is not None, (
+                "free_mamba_cache with extra buffer requires the req's track "
+                "buffer; detached session slots must free via the session path"
             )
+            mamba_ping_pong_track_buffer_to_free = req.mamba_ping_pong_track_buffer
             if mamba_ping_pong_track_buffer_to_keep is not None:
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,

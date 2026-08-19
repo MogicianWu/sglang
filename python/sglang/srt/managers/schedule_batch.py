@@ -2597,21 +2597,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if mamba_extra_buffer_enabled():
+            # Pageable-source uploads block the scheduler thread until the
+            # stream drains; stage through pinned memory like seq_lens above.
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
-                device=self.device,
-            )
+                pin_memory=_pin,
+            ).to(self.device, non_blocking=True)
             self.mamba_track_mask = torch.tensor(
                 mamba_track_mask_cpu,
                 dtype=torch.bool,
-                device=self.device,
-            )
+                pin_memory=_pin,
+            ).to(self.device, non_blocking=True)
             self.mamba_track_seqlens = torch.tensor(
                 mamba_track_seqlens_cpu,
                 dtype=torch.int64,
-                device=self.device,
-            )
+                pin_memory=_pin,
+            ).to(self.device, non_blocking=True)
+            # Keep the host copy so consumers can test the mask without a
+            # device sync (see hybrid_linear_attn_backend).
+            self.mamba_track_mask_cpu = mamba_track_mask_cpu
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
