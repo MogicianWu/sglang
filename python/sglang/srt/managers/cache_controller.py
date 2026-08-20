@@ -693,6 +693,10 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
+    def dispatch_ready_writes(self) -> None:
+        """No parked writes on the base controller; the hybrid controller
+        overrides this to dispatch ops staged behind an async index D2H."""
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return

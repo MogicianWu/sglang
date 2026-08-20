@@ -104,11 +104,18 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
-        # Resolve the tracked-row selection once per forward
-        has_mamba_track_mask = bool(
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        )
+        # Resolve the tracked-row selection once per forward. The mask is
+        # scheduler-authored; prefer its host copy — bool(tensor.any()) is a
+        # blocking D2H sync on the scheduler thread.
+        if forward_batch.mamba_track_mask_cpu is not None:
+            has_mamba_track_mask = forward_batch.mamba_track_mask is not None and any(
+                forward_batch.mamba_track_mask_cpu
+            )
+        else:
+            has_mamba_track_mask = bool(
+                forward_batch.mamba_track_mask is not None
+                and forward_batch.mamba_track_mask.any()
+            )
         _real_bs = forward_batch._original_batch_size
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()

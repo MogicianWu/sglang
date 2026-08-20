@@ -1884,6 +1884,9 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
+        # Dispatch any write ops parked behind their async index D2H first,
+        # so their acks become visible to the checks below.
+        cc.dispatch_ready_writes()
 
         if write_back:
             # Blocking: wait for all pending write-backs
